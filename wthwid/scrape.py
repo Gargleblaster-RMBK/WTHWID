@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import bz2
+import io
 import json
 import re
 import sys
@@ -31,6 +32,7 @@ from typing import IO, Iterator
 from xml.etree.ElementTree import iterparse
 
 import requests
+import urllib3
 
 from .diffs import make_diff
 from .summaries import clean_summary
@@ -71,18 +73,62 @@ def site_url(wiki: str) -> str:
     return f"https://{lang.replace('_', '-')}.wikipedia.org"
 
 
-def _open(source: str) -> tuple[IO[bytes], requests.Response | None]:
-    if source.startswith(("http://", "https://")):
-        resp = _http().get(source, stream=True, timeout=120)
+class ResumableHTTP(io.RawIOBase):
+    """Read-only stream over a URL that reconnects with a Range request when
+    the connection drops, so a multi-GB shard never restarts from byte 0."""
+
+    ERRORS = (requests.RequestException, urllib3.exceptions.HTTPError, OSError)
+
+    def __init__(self, url: str, retries: int = 8):
+        self.url, self.retries, self.pos = url, retries, 0
+        self.session = _http()
+        self.resp = self._connect()
+
+    def _connect(self) -> requests.Response:
+        headers = {"Range": f"bytes={self.pos}-"} if self.pos else {}
+        resp = self.session.get(self.url, stream=True, timeout=120, headers=headers)
         resp.raise_for_status()
-        resp.raw.decode_content = True
-        stream: IO[bytes] = resp.raw
+        if self.pos and resp.status_code != 206:
+            resp.close()
+            raise OSError(f"server ignored Range request for {self.url}")
+        return resp
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buf) -> int:
+        for attempt in range(self.retries + 1):
+            try:
+                n = self.resp.raw.readinto(buf)
+                self.pos += n
+                return n
+            except self.ERRORS as e:
+                if attempt == self.retries:
+                    raise
+                wait = 2 ** (attempt + 1)
+                print(f"[resume at byte {self.pos} in {wait}s] {self.url}: {e}",
+                      file=sys.stderr)
+                time.sleep(wait)
+                self.resp.close()
+                try:
+                    self.resp = self._connect()
+                except self.ERRORS as e2:
+                    print(f"[reconnect failed] {e2}", file=sys.stderr)
+        return 0  # unreachable
+
+    def close(self) -> None:
+        self.resp.close()
+        super().close()
+
+
+def _open(source: str) -> IO[bytes]:
+    if source.startswith(("http://", "https://")):
+        stream: IO[bytes] = io.BufferedReader(ResumableHTTP(source), 1 << 20)
     else:
-        resp = None
         stream = open(source, "rb")
     if source.endswith(".bz2"):
         stream = bz2.BZ2File(stream)
-    return stream, resp
+    return stream
 
 
 def _local(tag: str) -> str:
@@ -194,33 +240,28 @@ def extract_pairs(
 
 
 def scrape_shard(job: dict) -> tuple[str, int]:
+    """Scrape one shard; returns (source, pairs written, or -1 on failure)."""
     src, out = job["source"], Path(job["out"])
-    for attempt in range(5):
-        written = 0
-        try:
-            stream, resp = _open(src)
-            with stream, out.open("w", encoding="utf-8") as f:
-                pairs = extract_pairs(
-                    iter_revisions(stream),
-                    job["wiki"],
-                    job["namespaces"],
-                    job["since"],
-                    job["max_diff_chars"],
-                    job["keep_bots"],
-                )
-                for rec in pairs:
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    written += 1
-                    if job["limit"] and written >= job["limit"]:
-                        break
-            if resp is not None:
-                resp.close()
-            return src, written
-        except (requests.RequestException, OSError, EOFError) as e:
-            wait = 2 ** (attempt + 1)
-            print(f"[retry {attempt + 1}/5 in {wait}s] {src}: {e}", file=sys.stderr)
-            time.sleep(wait)
-    raise RuntimeError(f"giving up on {src}")
+    written = 0
+    try:
+        with _open(src) as stream, out.open("w", encoding="utf-8") as f:
+            pairs = extract_pairs(
+                iter_revisions(stream),
+                job["wiki"],
+                job["namespaces"],
+                job["since"],
+                job["max_diff_chars"],
+                job["keep_bots"],
+            )
+            for rec in pairs:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                written += 1
+                if job["limit"] and written >= job["limit"]:
+                    break
+    except Exception as e:  # keep the other shards going; reported in main()
+        print(f"[failed] {src}: {e!r}", file=sys.stderr)
+        return src, -1
+    return src, written
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -256,19 +297,29 @@ def main(argv: list[str] | None = None) -> None:
         for s, part in zip(sources, parts)
     ]
     print(f"scraping {len(jobs)} shard(s) with {a.workers} worker(s)", file=sys.stderr)
-    total = 0
+    total, failed = 0, []
     with ProcessPoolExecutor(max_workers=a.workers) as pool:
-        for src, n in pool.map(scrape_shard, jobs):
+        for (src, n), part in zip(pool.map(scrape_shard, jobs), parts):
+            if n < 0:
+                failed.append(src)
+                part.unlink(missing_ok=True)
+                continue
             total += n
             print(f"{n:>9} pairs  {src}", file=sys.stderr)
 
     with out.open("w", encoding="utf-8") as f:
         for part in parts:
+            if not part.exists():
+                continue
             with part.open(encoding="utf-8") as pf:
                 for line in pf:
                     f.write(line)
             part.unlink()
     print(f"wrote {total} pairs to {out}", file=sys.stderr)
+    if failed:
+        print("failed shards (rerun with --files):\n  " + "\n  ".join(failed),
+              file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
