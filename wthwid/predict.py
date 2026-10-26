@@ -28,7 +28,7 @@ def main(argv=None):
         sys.exit("no hunks found; pass a unified diff (e.g. `git diff`)")
     tok = AutoTokenizer.from_pretrained(a.model)
     model = AutoModelForSeq2SeqLM.from_pretrained(a.model)
-    print(generate(model, tok, [src], 384, 48, beams=a.beams)[0])
+    print(generate(model, tok, [src], 256, 48, beams=a.beams)[0])
 
 
 if __name__ == "__main__":

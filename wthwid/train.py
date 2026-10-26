@@ -62,7 +62,8 @@ def generate(model, tok, srcs, max_src, max_tgt, beams=4, batch_size=16):
     for i in range(0, len(srcs), batch_size):
         enc = tok(srcs[i : i + batch_size], max_length=max_src, truncation=True,
                   padding=True, return_tensors="pt")
-        ids = model.generate(**enc, max_new_tokens=max_tgt, num_beams=beams)
+        ids = model.generate(**enc, max_new_tokens=max_tgt, num_beams=beams,
+                             no_repeat_ngram_size=3)
         out.extend(tok.batch_decode(ids, skip_special_tokens=True))
     return out
 
@@ -88,7 +89,7 @@ def main(argv=None):
     p.add_argument("--steps", type=int, default=3000)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--lr", type=float, default=5e-4)
-    p.add_argument("--max-src", type=int, default=384)
+    p.add_argument("--max-src", type=int, default=256)
     p.add_argument("--max-tgt", type=int, default=48)
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--val-size", type=int, default=1000)
