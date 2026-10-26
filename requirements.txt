@@ -1,0 +1,5 @@
+requests>=2.31
+torch>=2.2
+transformers>=4.40,<5  # 5.x cannot load the CodeT5 tokenizer config
+rouge-score>=0.1.2
+pytest>=8
