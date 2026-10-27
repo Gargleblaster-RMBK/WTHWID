@@ -68,3 +68,18 @@ Any unified diff works. It's normalised to a compact word-level form
 ```sh
 .venv/bin/python -m pytest -q
 ```
+
+## Results (first run)
+
+CodeT5-small, 1,000 steps × 16 on CPU, trained on 1.87M Simple English Wikipedia
+pairs. Scored on 500 edits from held-out articles:
+
+| | ROUGE-L | Exact match |
+|---|---|---|
+| Model | 37.6 | 17.0% |
+| Always output the most common summary | 9.2 | 2.8% |
+
+Most of that score comes from summaries written by tools (HotCat, AWB, IABot), which
+are formulaic and easy to predict. On human-written summaries, and on code diffs, it
+often falls back to a tool-style line or echoes the changed text. The next step is
+filtering tool summaries out of the training data and training longer, ideally on a GPU.
